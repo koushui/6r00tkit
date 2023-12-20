@@ -2,7 +2,7 @@
 
 ## Description
 
-6r00tkit (Grootkit) is a rootkit used to hide and protect itself and other rootkits, to hide process and to set root permissions on a process (privilege escalation).
+6r00tkit (Grootkit) is a rootkit used to hide and protect itself and other rootkits, to hide malware and persistence file for 6r00tkit, to hide process and to set root permissions on a process (privilege escalation).
 
 How it's works:
  - Remove itself and other rootkit from the kernel modules list
@@ -10,8 +10,8 @@ How it's works:
  - Hooks 4 syscalls
     - `mkdir`, to get the root permissions for any process you may use the passphrase in `mkdir` syscall (default passphrase is `1 4m 6r00t`)
     - `kill`, to get a hidden process you may use the special signal in `kill` syscall (default is `14600` - numbers in `1 4m 6r00t`)
-    - `getdents64` to hide process (process directory in `/proc`)
-    - `getdents` to hide process (process directory in `/proc`)
+    - `getdents64` to hide process and files (process directory in `/proc` or customizable malware file and directory)
+    - `getdents` to hide process and files (process directory in `/proc` or customizable malware file and directory)
 
 ## Requirements
 
@@ -38,7 +38,7 @@ sudo insmod ./6r00tkit.ko
 ### Add parameters
 
 ```bash
-sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" killcode=666
+sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" killcode=666 rootkitdirectory="/rootkit/directory" rootkitfile="rootkit.ko" persistencedirectory="/persistence/directory" persistencefile="mycron" malwarefile="my_malware_filename.malware"
 ```
 
 ## Usages

