@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###################
-#    This script generates kernel, initramfs with busybox and 6r00tkit and start the it with qemu
+#    This script generates kernel and initramfs with busybox and 6r00tkit and start the it with qemu
 #    Copyright (C) 2023  Maurice Lambert
 
 #    This program is free software: you can redistribute it and/or modify
