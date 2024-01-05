@@ -12,7 +12,7 @@
 How it's works:
  - Remove itself and other rootkit from the kernel modules lists (*procfs* and *sysfs*)
  - Permanently use itself and the other rootkit to block module unloading
- - Hooks 6 syscalls:
+ - Hooks 9 syscalls:
      - `mkdir`, to get the root permissions for any process you may use the passphrase in `mkdir` syscall (default passphrase is `1 4m 6r00t`)
      - `kill`
          - to hide a process you may use the special signal in `kill` syscall (default is `14600` - numbers in `1 4m 6r00t`)
@@ -23,7 +23,7 @@ How it's works:
      - `getdents64` to hide process and files (process directory in `/proc` and customizable malware file and directory)
      - `getdents` to hide process and files (process directory in `/proc` and customizable malware file and directory)
      - `recvmsg` to hide connection from socket (like `ss` command)
-     - `filp_open` to modify timestamps on files (*access*, *creation* and *modify* timestamps to block investigations and forensic)
+     - `openat`, `open`, `fstat`, `newfstatat` to modify timestamps on files (*access*, *creation* and *modify* timestamps to block investigations and forensic) and hide files
  - Hooks 5 kernel functions:
      - `tcp4_seq_show`, `udp4_seq_show`, `tcp6_seq_show` and `udp6_seq_show` to hide connections from `/proc/net/tcp`, `/proc/net/udp`, `/proc/net/tcp6` and `/proc/net/udp6` (like `netstat` command)
      - `current_time` to change *creation* timestamp on files
