@@ -1,4 +1,4 @@
-![6r00tkit Logo](https://mauricelambert.github.io/info/kernel/security/6r00tkit.png "6r00tkit logo")
+![6r00tkit Logo](https://mauricelambert.github.io/info/kernel/security/6r00tkit_small.png "6r00tkit logo")
 
 # 6r00tkit
 
